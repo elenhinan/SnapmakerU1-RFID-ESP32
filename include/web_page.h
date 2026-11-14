@@ -463,6 +463,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             <span class="stat-value" id="val-timeout">--</span>
           </div>
           <div class="stat-row">
+            <span class="stat-label">Last Bound Event</span>
+            <span class="stat-value" id="val-last-bound">None</span>
+          </div>
+          <div class="stat-row">
             <span class="stat-label">Moonraker Host</span>
             <span class="stat-value" id="val-moonraker">Checking...</span>
           </div>
@@ -484,24 +488,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             <span style="font-size:0.8rem; font-weight:normal; color:var(--text-muted);">Moonraker Sensors</span>
           </div>
 
-          <!-- Filament Extruder Lanes E0-E3 -->
+          <!-- Filament Extruder Lanes 1-4 (Channels 0-3) -->
           <div class="sensor-grid">
-            <div id="sensor-0" class="sensor-box empty">
-              <div class="name">Extruder E0</div>
+            <div id="sensor-0" class="sensor-box empty" onclick="manualBindChannel(0)" style="cursor:pointer;" title="Click while ARMED to bind scanned spool to Extruder 1">
+              <div class="name">Extruder 1</div>
               <div class="status" id="sensor-0-text">Empty</div>
             </div>
-            <div id="sensor-1" class="sensor-box empty">
-              <div class="name">Extruder E1</div>
+            <div id="sensor-1" class="sensor-box empty" onclick="manualBindChannel(1)" style="cursor:pointer;" title="Click while ARMED to bind scanned spool to Extruder 2">
+              <div class="name">Extruder 2</div>
               <div class="status" id="sensor-1-text">Empty</div>
             </div>
-            <div id="sensor-2" class="sensor-box empty">
-              <div class="name">Extruder E2</div>
+            <div id="sensor-2" class="sensor-box empty" onclick="manualBindChannel(2)" style="cursor:pointer;" title="Click while ARMED to bind scanned spool to Extruder 3">
+              <div class="name">Extruder 3</div>
               <div class="status" id="sensor-2-text">Empty</div>
             </div>
-            <div id="sensor-3" class="sensor-box empty">
-              <div class="name">Extruder E3</div>
+            <div id="sensor-3" class="sensor-box empty" onclick="manualBindChannel(3)" style="cursor:pointer;" title="Click while ARMED to bind scanned spool to Extruder 4">
+              <div class="name">Extruder 4</div>
               <div class="status" id="sensor-3-text">Empty</div>
             </div>
+          </div>
+          <div style="font-size:0.78rem; color:var(--text-muted); text-align:center;">
+            Auto-binds when filament enters feeder, or click Extruder 1–4 while ARMED to bind immediately.
           </div>
 
           <!-- Staging & State Simulation Buttons -->
@@ -538,7 +545,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           </div>
           <div class="control-group">
             <label class="control-label" for="cfg-printer">Snapmaker U1 / Moonraker IP:</label>
-            <input type="text" id="cfg-printer" placeholder="10.0.2.30">
+            <input type="text" id="cfg-printer" placeholder="192.168.1.50">
           </div>
           <div class="control-group">
             <label class="control-label" for="cfg-port">Moonraker Port:</label>
@@ -550,7 +557,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           </div>
           <div class="control-group">
             <label class="control-label" for="cfg-spoolman">Spoolman URL (optional):</label>
-            <input type="text" id="cfg-spoolman" placeholder="http://10.0.2.2:7912">
+            <input type="text" id="cfg-spoolman" placeholder="http://192.168.1.50:7912">
           </div>
         </div>
 
@@ -832,6 +839,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       fetchStatus();
     }
 
+    async function manualBindChannel(ch) {
+      if (!currentStagedUid) {
+        showToast("Scan an RFID tag first to arm before binding to Extruder " + (ch + 1));
+        return;
+      }
+      await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ action: 'bind_channel', channel: ch })
+      });
+      showToast("Bound tag " + currentStagedUid + " to Extruder " + (ch + 1) + "!");
+      fetchStatus();
+    }
+
     function copyTagUid() {
       if (!currentStagedUid) return;
       navigator.clipboard.writeText(currentStagedUid).then(() => {
@@ -963,6 +984,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         document.getElementById('val-type').innerText = data.staged_type || '--';
         document.getElementById('val-scans').innerText = data.rfid_scans !== undefined ? data.rfid_scans : '--';
         document.getElementById('val-timeout').innerText = data.state === 'ARMED' ? (data.armed_remaining_s + 's') : '--';
+        const lastBoundEl = document.getElementById('val-last-bound');
+        if (lastBoundEl) {
+          if (data.last_bound_channel !== undefined && data.last_bound_channel >= 0) {
+            lastBoundEl.innerText = `Extruder ${data.last_bound_channel + 1} (${data.last_bound_uid}) [${data.last_bound_reason}]`;
+          } else {
+            lastBoundEl.innerText = 'None';
+          }
+        }
         document.getElementById('val-moonraker').innerText = data.moonraker_ok ? 'Connected (OK)' : 'Unreachable / Error';
         document.getElementById('val-moonraker').style.color = data.moonraker_ok ? '#22c55e' : '#ef4444';
 
@@ -977,10 +1006,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           promptCard.style.display = 'flex';
           document.getElementById('prompt-uid').innerText = currentStagedUid;
 
-          const baseSpoolUrl = (cachedSpoolmanUrl || 'http://10.0.2.2:7912').replace(/\/+$/, '');
+          const baseSpoolUrl = (cachedSpoolmanUrl || '').replace(/\/+$/, '');
           // Spoolman direct deep links: search or add spool with tag prefill
           const regLink = document.getElementById('btn-open-spoolman');
-          if (regLink) {
+          if (regLink && baseSpoolUrl) {
             regLink.href = `${baseSpoolUrl}/?search=${encodeURIComponent(currentStagedUid)}`;
           }
         } else {
@@ -1000,13 +1029,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             swatch.style.display = 'none';
           }
           const link = document.getElementById('spool-link');
-          const baseSpoolUrl = (cachedSpoolmanUrl || 'http://10.0.2.2:7912').replace(/\/+$/, '');
-          if (data.spool_id) {
-            link.href = `${baseSpoolUrl}/spool/show/${data.spool_id}`;
+          const baseSpoolUrl = (cachedSpoolmanUrl || '').replace(/\/+$/, '');
+          if (baseSpoolUrl) {
+            if (data.spool_id) {
+              link.href = `${baseSpoolUrl}/spool/show/${data.spool_id}`;
+            } else {
+              link.href = `${baseSpoolUrl}/?search=${encodeURIComponent(data.staged_uid || '')}`;
+            }
+            link.style.display = 'inline-block';
           } else {
-            link.href = `${baseSpoolUrl}/?search=${encodeURIComponent(data.staged_uid || '')}`;
+            link.style.display = 'none';
           }
-          link.style.display = 'inline-block';
         } else {
           spoolBox.style.display = 'none';
         }
@@ -1018,12 +1051,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             const sTxt = document.getElementById('sensor-' + i + '-text');
             if (sBox && sTxt && data.sensors[i] !== undefined) {
               const detected = data.sensors[i].detected;
+              const chState = data.sensors[i].state || '';
               if (detected) {
                 sBox.className = 'sensor-box detected';
-                sTxt.innerText = 'Filament Present';
+                sTxt.innerText = chState ? `Present (${chState})` : 'Filament Present';
               } else {
                 sBox.className = 'sensor-box empty';
-                sTxt.innerText = 'Empty';
+                sTxt.innerText = chState ? `Empty (${chState})` : 'Empty';
               }
             }
           }

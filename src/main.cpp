@@ -15,11 +15,11 @@
 
 // --- NVS Preferences & Config ---
 Preferences prefs;
-String wifiSsid        = "YOUR_WIFI_SSID";
-String wifiPassword    = "YOUR_WIFI_PASSWORD";
-String printerIp       = "10.0.2.30"; // Snapmaker U1 IP
+String wifiSsid        = "";
+String wifiPassword    = "";
+String printerIp       = ""; // Configured via Web UI / NVS
 int    moonrakerPort   = 7125;
-String spoolmanUrl     = "http://10.0.2.30:7912";
+String spoolmanUrl     = "";
 unsigned long stageTimeoutMs = 120000;
 const char* MDNS_NAME  = "snapmaker_rfid";
 
@@ -45,6 +45,10 @@ Adafruit_NeoPixel pixels(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
 
 // Sensor names in Snapmaker U1 / Klipper (URL query with %20 vs JSON keys with spaces)
+// First priority: filament_feed left (extruder0, extruder1) & filament_feed right (extruder2, extruder3)
+// These detect filament immediately at the entry feeder before it reaches the hotend!
+const char* FEED_QUERY_STRING = "filament_feed%20left&filament_feed%20right&filament_motion_sensor%20e0_filament&filament_motion_sensor%20e1_filament&filament_motion_sensor%20e2_filament&filament_motion_sensor%20e3_filament";
+
 const char* SENSOR_QUERY_NAMES[4] = {
   "filament_motion_sensor%20e0_filament",
   "filament_motion_sensor%20e1_filament",
@@ -83,6 +87,11 @@ String stagedSpoolColor = "";
 unsigned long armedTimestamp = 0;
 
 bool previousSensorState[4] = {false, false, false, false};
+String previousChannelState[4] = {"", "", "", ""};
+bool channelEligibleForAutoBind[4] = {false, false, false, false};
+uint8_t insertionDebounceCount[4] = {0, 0, 0, 0};
+unsigned long lastBindTimestamp = 0;
+unsigned long lastRfidScanTimestamp = 0;
 bool lastMoonrakerOk = false;
 bool isApMode = false;
 
@@ -91,6 +100,10 @@ uint8_t rfidVersion = 0x00;
 bool rfidConnected = false;
 unsigned long rfidScanCount = 0;
 String lastScannedUid = "";
+int    lastBoundChannel = -1;
+String lastBoundUid = "";
+String lastBoundReason = "";
+int    lastBoundHttpCode = 0;
 
 // LED & Visual Variables
 uint8_t animStep = 0;
@@ -185,17 +198,11 @@ String getPixelHex(uint8_t index) {
 // --- Preferences Loading & Saving ---
 void loadStoredConfig() {
   prefs.begin("snapmaker", false);
-  wifiSsid        = prefs.getString("ssid", "YOUR_WIFI_SSID");
-  wifiPassword    = prefs.getString("pass", "YOUR_WIFI_PASSWORD");
-  printerIp       = prefs.getString("printer_ip", "10.0.2.30");
-  if (printerIp == "192.168.1.100" || printerIp.length() == 0) {
-    printerIp = "10.0.2.30";
-  }
+  wifiSsid        = prefs.getString("ssid", "");
+  wifiPassword    = prefs.getString("pass", "");
+  printerIp       = prefs.getString("printer_ip", "");
   moonrakerPort   = prefs.getInt("port", 7125);
-  spoolmanUrl     = prefs.getString("spoolman_url", "http://10.0.2.2:7912");
-  if (spoolmanUrl.length() == 0 || spoolmanUrl.indexOf("192.168.1.100") >= 0 || spoolmanUrl.indexOf("10.0.2.30") >= 0) {
-    spoolmanUrl = "http://10.0.2.2:7912";
-  }
+  spoolmanUrl     = prefs.getString("spoolman_url", "");
   int timeoutSec  = prefs.getInt("timeout", 120);
   stageTimeoutMs  = (timeoutSec > 0 ? timeoutSec : 120) * 1000UL;
   currentBrightness = (uint8_t)prefs.getInt("brightness", 80);
@@ -343,7 +350,7 @@ void querySpoolmanForTag(const String& uid) {
   http.end();
 }
 
-bool updateSensorStates(bool currentStates[4]) {
+bool updateSensorStates(bool currentStates[4], String channelStates[4]) {
   if (WiFi.status() != WL_CONNECTED) {
     lastMoonrakerOk = false;
     return false;
@@ -351,11 +358,7 @@ bool updateSensorStates(bool currentStates[4]) {
 
   HTTPClient http;
   http.setTimeout(1500); // 1.5-second timeout
-  String url = String("http://") + printerIp + ":" + String(moonrakerPort) + "/printer/objects/query?";
-  for (int i = 0; i < 4; i++) {
-    url += SENSOR_QUERY_NAMES[i];
-    if (i < 3) url += "&";
-  }
+  String url = String("http://") + printerIp + ":" + String(moonrakerPort) + "/printer/objects/query?" + FEED_QUERY_STRING;
 
   http.begin(url);
   int httpCode = http.GET();
@@ -390,7 +393,26 @@ bool updateSensorStates(bool currentStates[4]) {
   if (deserializeJson(doc, payload)) return false;
 
   JsonObject status = doc["result"]["status"];
+
+  // 1. Primary: Check Snapmaker U1 entry feeder modules (filament_feed left & right)
+  // These trigger as soon as filament is pushed into the feeder, BEFORE hotend loading!
+  bool hasFeedModules = !status["filament_feed left"].isNull() && !status["filament_feed right"].isNull();
+  if (hasFeedModules) {
+    const char* feedGroup[4] = {"filament_feed left", "filament_feed left", "filament_feed right", "filament_feed right"};
+    const char* extKey[4]    = {"extruder0", "extruder1", "extruder2", "extruder3"};
+    for (int i = 0; i < 4; i++) {
+      JsonObject extObj = status[feedGroup[i]][extKey[i]];
+      if (!extObj.isNull()) {
+        currentStates[i] = extObj["filament_detected"].as<bool>();
+        channelStates[i] = extObj["channel_state"].as<String>();
+      }
+    }
+    return true;
+  }
+
+  // 2. Fallback: Check motion or switch sensors
   for (int i = 0; i < 4; i++) {
+    channelStates[i] = "";
     if (!status[SENSOR_KEY_NAMES[i]].isNull()) {
       currentStates[i] = status[SENSOR_KEY_NAMES[i]]["filament_detected"].as<bool>();
     } else if (!status[FALLBACK_KEY_NAMES[i]].isNull()) {
@@ -410,7 +432,13 @@ bool registerSpoolToPaxx(int channel, const String& uid, const String& type) {
   JsonDocument payload;
   payload["channel"] = channel;
   JsonObject info = payload["info"].to<JsonObject>();
-  info["CARD_UID"] = uid;
+  // Klipper's filament_detect.py expects CARD_UID as a JSON array of integer bytes (e.g. [4, 17, 86, ...])
+  JsonArray uidArr = info["CARD_UID"].to<JsonArray>();
+  for (unsigned int i = 0; i + 1 < uid.length(); i += 2) {
+    String byteHex = uid.substring(i, i + 2);
+    uint8_t byteVal = (uint8_t)strtoul(byteHex.c_str(), nullptr, 16);
+    uidArr.add(byteVal);
+  }
   info["CARD_TYPE"] = type;
 
   String body;
@@ -418,6 +446,10 @@ bool registerSpoolToPaxx(int channel, const String& uid, const String& type) {
 
   int code = http.POST(body);
   http.end();
+  lastBoundChannel = channel;
+  lastBoundUid = uid;
+  lastBoundHttpCode = code;
+  Serial.printf("registerSpoolToPaxx(ch=%d, uid=%s) -> HTTP %d\n", channel, uid.c_str(), code);
   return (code == 200);
 }
 
@@ -443,6 +475,10 @@ void handleApiStatus() {
   doc["rfid_connected"] = rfidConnected;
   doc["rfid_scans"] = rfidScanCount;
   doc["last_scanned_uid"] = lastScannedUid;
+  doc["last_bound_channel"] = lastBoundChannel;
+  doc["last_bound_uid"] = lastBoundUid;
+  doc["last_bound_reason"] = lastBoundReason;
+  doc["last_bound_http"] = lastBoundHttpCode;
 
   if (currentState == STATE_ARMED) {
     unsigned long elapsed = millis() - armedTimestamp;
@@ -455,8 +491,9 @@ void handleApiStatus() {
   for (int i = 0; i < 4; i++) {
     JsonObject s = sensors.add<JsonObject>();
     s["channel"] = i;
-    s["name"] = String("E") + i;
+    s["name"] = String("Extruder ") + (i + 1);
     s["detected"] = previousSensorState[i];
+    s["state"] = previousChannelState[i];
   }
 
   doc["moonraker_ok"] = lastMoonrakerOk;
@@ -470,6 +507,7 @@ void handleApiStatus() {
 
   doc["wifi_ssid"] = isApMode ? "Snapmaker-RFID-Setup (AP)" : WiFi.SSID();
   doc["wifi_ip"] = isApMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  doc["wifi_hostname"] = WiFi.getHostname();
   doc["wifi_rssi"] = isApMode ? 0 : WiFi.RSSI();
   doc["free_heap"] = ESP.getFreeHeap();
   doc["uptime_s"] = millis() / 1000;
@@ -482,8 +520,8 @@ void handleApiStatus() {
 void handleApiConfig() {
   if (server.method() == HTTP_GET) {
     JsonDocument doc;
-    doc["ssid"] = (wifiSsid == "YOUR_WIFI_SSID") ? "" : wifiSsid;
-    doc["has_password"] = (wifiPassword.length() > 0 && wifiPassword != "YOUR_WIFI_PASSWORD");
+    doc["ssid"] = wifiSsid;
+    doc["has_password"] = (wifiPassword.length() > 0);
     doc["printer_ip"] = printerIp;
     doc["port"] = moonrakerPort;
     doc["spoolman_url"] = spoolmanUrl;
@@ -604,6 +642,10 @@ void handleApiAction() {
       armedTimestamp = millis();
       animStep = 0;
       manualLedMode = false;
+      for (int i = 0; i < 4; i++) {
+        channelEligibleForAutoBind[i] = (!previousSensorState[i] || previousChannelState[i] == "wait_insert");
+        insertionDebounceCount[i] = 0;
+      }
       querySpoolmanForTag(stagedUID);
     } else if (action.equalsIgnoreCase("disarm")) {
       currentState = STATE_IDLE;
@@ -613,7 +655,22 @@ void handleApiAction() {
       stagedSpoolColor = "";
       manualLedMode = false;
     } else if (action.equalsIgnoreCase("refresh_sensors")) {
-      updateSensorStates(previousSensorState);
+      updateSensorStates(previousSensorState, previousChannelState);
+    } else if (action.equalsIgnoreCase("bind_channel")) {
+      int ch = server.hasArg("channel") ? server.arg("channel").toInt() : -1;
+      if (ch >= 0 && ch < 4 && stagedUID.length() > 0) {
+        lastBoundReason = "manual_click_Ext" + String(ch + 1);
+        if (registerSpoolToPaxx(ch, stagedUID, stagedType)) {
+          flashFeedback(pixels.Color(0, 220, 0), 3, 150);
+          stagedUID = "";
+          stagedSpoolId = 0;
+          stagedSpoolInfo = "";
+          stagedSpoolColor = "";
+          currentState = STATE_IDLE;
+        } else {
+          flashFeedback(pixels.Color(220, 0, 0), 3, 150);
+        }
+      }
     } else if (action.equalsIgnoreCase("reboot")) {
       server.send(200, "application/json", "{\"status\":\"ok\",\"rebooting\":true}");
       delay(200);
@@ -640,8 +697,10 @@ void setup() {
   Serial.printf("RC522 Version: 0x%02X (%s)\n", rfidVersion, rfidConnected ? "Connected" : "COMMUNICATION ERROR - Check Wiring!");
 
   // Connect to Wi-Fi with fallback to SoftAP
+  WiFi.setHostname("snapmaker-rfid"); // Valid RFC 952/1123 DHCP hostname for OPNsense / Unbound
   WiFi.mode(WIFI_STA);
-  bool wifiConfigured = (wifiSsid.length() > 0 && wifiSsid != "YOUR_WIFI_SSID");
+  WiFi.setHostname("snapmaker-rfid");
+  bool wifiConfigured = (wifiSsid.length() > 0);
 
   if (wifiConfigured) {
     Serial.printf("Connecting to Wi-Fi '%s'...\n", wifiSsid.c_str());
@@ -694,7 +753,7 @@ void setup() {
 
   // Pre-seed baseline switch states if connected
   if (!isApMode) {
-    updateSensorStates(previousSensorState);
+    updateSensorStates(previousSensorState, previousChannelState);
   }
   pixels.clear();
   pixels.show();
@@ -718,7 +777,7 @@ void loop() {
     // Background sensor poll (every 4 seconds) to keep Web UI up to date
     if (!isApMode && millis() - lastSensorPoll >= 4000) {
       lastSensorPoll = millis();
-      updateSensorStates(previousSensorState);
+      updateSensorStates(previousSensorState, previousChannelState);
     }
 
     // Check RFID card presence (every 40ms)
@@ -732,6 +791,15 @@ void loop() {
       }
 
       if (isCardPresent() && rfid.PICC_ReadCardSerial()) {
+        unsigned long now = millis();
+        // Debounce: ignore repeated RFID scans within 1.5s
+        if (now - lastRfidScanTimestamp < 1500) {
+          rfid.PICC_HaltA();
+          rfid.PCD_StopCrypto1();
+          return;
+        }
+        lastRfidScanTimestamp = now;
+
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
           if (rfid.uid.uidByte[i] < 0x10) uid += "0";
@@ -757,8 +825,14 @@ void loop() {
 
         // Snapshot current sensor state at moment of tag tap
         if (!isApMode) {
-          updateSensorStates(previousSensorState);
+          updateSensorStates(previousSensorState, previousChannelState);
           querySpoolmanForTag(stagedUID);
+        }
+
+        // Only channels that are empty at the moment of scanning can auto-bind
+        for (int i = 0; i < 4; i++) {
+          channelEligibleForAutoBind[i] = (!previousSensorState[i] || previousChannelState[i] == "wait_insert");
+          insertionDebounceCount[i] = 0;
         }
 
         currentState = STATE_ARMED;
@@ -789,10 +863,31 @@ void loop() {
       lastSensorPoll = millis();
 
       bool currentSensorState[4];
-      if (updateSensorStates(currentSensorState)) {
+      String currentChannelState[4];
+      if (updateSensorStates(currentSensorState, currentChannelState)) {
         for (int i = 0; i < 4; i++) {
-          // Transition: false -> true (filament inserted into sensor)
-          if (!previousSensorState[i] && currentSensorState[i]) {
+          // Trigger ONLY for channels that were empty when armed
+          if (!channelEligibleForAutoBind[i]) {
+            insertionDebounceCount[i] = 0;
+            continue;
+          }
+
+          // Check if filament is currently detected or feeder active
+          bool activeNow = currentSensorState[i] || (currentChannelState[i] != "wait_insert" && currentChannelState[i].length() > 0);
+
+          if (activeNow) {
+            insertionDebounceCount[i]++;
+          } else {
+            insertionDebounceCount[i] = 0;
+          }
+
+          // Debounce threshold: require 2 consecutive confirmed polls (~500ms) of filament presence
+          if (insertionDebounceCount[i] >= 2) {
+            bool detectedEdge = (!previousSensorState[i] && currentSensorState[i]);
+            lastBoundReason = detectedEdge
+              ? ("debounced_edge_Ext" + String(i + 1))
+              : ("debounced_state_" + currentChannelState[i] + "_Ext" + String(i + 1));
+
             if (registerSpoolToPaxx(i, stagedUID, stagedType)) {
               flashFeedback(pixels.Color(0, 220, 0), 3, 150); // Triple green flash
             } else {
@@ -800,15 +895,18 @@ void loop() {
             }
 
             stagedUID = "";
+            stagedSpoolId = 0;
             stagedSpoolInfo = "";
             stagedSpoolColor = "";
             currentState = STATE_IDLE;
+            lastBindTimestamp = millis();
             break;
           }
         }
 
         for (int i = 0; i < 4; i++) {
           previousSensorState[i] = currentSensorState[i];
+          previousChannelState[i] = currentChannelState[i];
         }
       }
     }

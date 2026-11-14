@@ -76,9 +76,9 @@ Instead of manual UI selection, this device uses an automated **staged binding**
    * Set **RFID Detection System** to `External` (disables internal coils and accepts network API scans).
 4. **Configure Spoolman:**
    * Set **Spoolman Integration** to `Enabled`.
-   * Set **Spoolman URL** to your Spoolman instance (e.g., `http://10.0.2.2:7912`).
+   * Set **Spoolman URL** to your Spoolman instance (e.g., `http://<SPOOLMAN_IP>:7912`).
    * Set **Spoolman Tag Storage** to `native` (Spoolman v0.27.0+) or `card_uids` (legacy extra field).
-5. **Verify Sensor Names:** In Moonraker (`http://10.0.2.30:7125/printer/objects/list`), the filament switches match the array in firmware:
+5. **Verify Sensor Names:** In Moonraker (`http://<PRINTER_IP>:7125/printer/objects/list`), the filament switches match the array in firmware:
    * `filament_motion_sensor e0_filament`
    * `filament_motion_sensor e1_filament`
    * `filament_motion_sensor e2_filament`
