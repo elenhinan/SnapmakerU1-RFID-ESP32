@@ -39,15 +39,21 @@ const char* MDNS_NAME  = "snapmaker_rfid";
 // 2: 330° / -30° (Top-Left)
 const uint8_t RING_CW[6] = {1, 0, 5, 4, 3, 2};
 
+// Extruders 1 to 4 mapping to top arch LEDs (Left-to-Right: West -> NW -> NE -> East):
+// Extruder 1 (Ch 0): LED 3 (270° / West)
+// Extruder 2 (Ch 1): LED 2 (330° / NW)
+// Extruder 3 (Ch 2): LED 1 (30°  / NE)
+// Extruder 4 (Ch 3): LED 0 (90°  / East)
+const uint8_t EXTRUDER_LEDS[4] = {3, 2, 1, 0};
+
 // --- Hardware & Web Instances ---
 MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
 Adafruit_NeoPixel pixels(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 WebServer server(80);
 
-// Sensor names in Snapmaker U1 / Klipper (URL query with %20 vs JSON keys with spaces)
-// First priority: filament_feed left (extruder0, extruder1) & filament_feed right (extruder2, extruder3)
-// These detect filament immediately at the entry feeder before it reaches the hotend!
-const char* FEED_QUERY_STRING = "filament_feed%20left&filament_feed%20right&filament_motion_sensor%20e0_filament&filament_motion_sensor%20e1_filament&filament_motion_sensor%20e2_filament&filament_motion_sensor%20e3_filament";
+// Sensor & Spool query in Snapmaker U1 / Klipper
+// Query feeders, runout sensors, and print_task_config (for spool colors)
+const char* FEED_QUERY_STRING = "filament_feed%20left&filament_feed%20right&filament_motion_sensor%20e0_filament&filament_motion_sensor%20e1_filament&filament_motion_sensor%20e2_filament&filament_motion_sensor%20e3_filament&print_task_config";
 
 const char* SENSOR_QUERY_NAMES[4] = {
   "filament_motion_sensor%20e0_filament",
@@ -88,6 +94,8 @@ unsigned long armedTimestamp = 0;
 
 bool previousSensorState[4] = {false, false, false, false};
 String previousChannelState[4] = {"", "", "", ""};
+uint32_t activeSpoolColors[4] = {0, 0, 0, 0};
+int activeSpoolIds[4] = {0, 0, 0, 0};
 bool channelEligibleForAutoBind[4] = {false, false, false, false};
 uint8_t insertionDebounceCount[4] = {0, 0, 0, 0};
 unsigned long lastBindTimestamp = 0;
@@ -296,6 +304,26 @@ void updateIdleVisuals() {
 
   pixels.clear();
   pixels.setPixelColor(CENTER_LED_INDEX, pixels.Color(brightness, brightness, brightness));
+
+  // Top arch LEDs (indices 3, 2, 1, 0) display loaded spool colors for Extruders 1 to 4
+  for (int i = 0; i < 4; i++) {
+    uint8_t ledIndex = EXTRUDER_LEDS[i];
+    // If filament is detected in this extruder and a spool color is mapped
+    if (previousSensorState[i] && activeSpoolColors[i] != 0) {
+      pixels.setPixelColor(ledIndex, activeSpoolColors[i]);
+    } else if (previousSensorState[i]) {
+      // Filament detected but no color mapped yet -> dim white
+      pixels.setPixelColor(ledIndex, pixels.Color(15, 15, 15));
+    } else {
+      // Empty lane -> off
+      pixels.setPixelColor(ledIndex, 0);
+    }
+  }
+
+  // Bottom LEDs (4 & 5) remain off in idle
+  pixels.setPixelColor(4, 0);
+  pixels.setPixelColor(5, 0);
+
   pixels.show();
 }
 
@@ -393,6 +421,28 @@ bool updateSensorStates(bool currentStates[4], String channelStates[4]) {
   if (deserializeJson(doc, payload)) return false;
 
   JsonObject status = doc["result"]["status"];
+
+  // Parse active filament spool IDs and colors from print_task_config
+  if (!status["print_task_config"].isNull()) {
+    JsonObject ptc = status["print_task_config"];
+    JsonArray spoolIds = ptc["filament_spool_id"];
+    JsonArray colorsRgba = ptc["filament_color_rgba"];
+
+    for (int i = 0; i < 4; i++) {
+      if (i < (int)spoolIds.size()) {
+        activeSpoolIds[i] = spoolIds[i].as<int>();
+      }
+      if (i < (int)colorsRgba.size()) {
+        String rgba = colorsRgba[i].as<String>();
+        // rgba format e.g. "FDFFF2FF" or "929599"
+        if (rgba.length() >= 6) {
+          activeSpoolColors[i] = parseHexColor(String("#") + rgba.substring(0, 6));
+        } else {
+          activeSpoolColors[i] = 0;
+        }
+      }
+    }
+  }
 
   // 1. Primary: Check Snapmaker U1 entry feeder modules (filament_feed left & right)
   // These trigger as soon as filament is pushed into the feeder, BEFORE hotend loading!
